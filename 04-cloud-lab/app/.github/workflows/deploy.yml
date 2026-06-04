@@ -1,0 +1,87 @@
+name: Deploy Lambda (Terraform + AWS CLI)
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_REGION: us-east-1
+      S3_BUCKET_NAME: "${{ github.repository_owner }}-envioclick-04cloudlab-${{ github.run_number }}"
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r 04-cloud-lab/app/requirements.txt
+
+      - name: Run tests
+        working-directory: 04-cloud-lab/app
+        run: |
+          pytest test_main.py
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: "1.5.7"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Terraform Init & Apply (create S3 bucket + IAM role)
+        working-directory: 04-cloud-lab/app/infra
+        env:
+          TF_VAR_s3_bucket_name: ${{ env.S3_BUCKET_NAME }}
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+        run: |
+          terraform init
+          terraform apply -auto-approve
+
+      - name: Package Lambda
+        working-directory: 04-cloud-lab/app
+        run: |
+          zip -j lambda_function.zip main.py
+
+      - name: Install AWS CLI
+        run: |
+          python -m pip install --upgrade pip
+          pip install awscli
+
+      - name: Upload artifact to S3
+        working-directory: 04-cloud-lab/app
+        run: |
+          aws s3 cp lambda_function.zip s3://${{ env.S3_BUCKET_NAME }}/lambda_function.zip
+
+      - name: Create or update Lambda function
+        working-directory: 04-cloud-lab/app/infra
+        run: |
+          ROLE_ARN=$(terraform output -raw lambda_role_arn)
+          set +e
+          aws lambda get-function --function-name envioclick-04-cloud-lab
+          if [ $? -ne 0 ]; then
+            aws lambda create-function \
+              --function-name envioclick-04-cloud-lab \
+              --runtime python3.11 \
+              --handler main.handler \
+              --role "$ROLE_ARN" \
+              --code S3Bucket=${{ env.S3_BUCKET_NAME }},S3Key=lambda_function.zip
+          else
+            aws lambda update-function-code \
+              --function-name envioclick-04-cloud-lab \
+              --s3-bucket ${{ env.S3_BUCKET_NAME }} \
+              --s3-key lambda_function.zip
+          fi

@@ -1,0 +1,115 @@
+name: CI/CD Continuous Deployment (Laravel + Vue)
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  test-and-validate:
+    name: 🧪 Run Tests & Code Quality
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP Environment
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, dom, curl, libxml, pdo, mysql
+          coverage: none
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # OPTIMIZACIÓN: Caché de Dependencias de Composer
+      - name: Cache Composer Dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      # OPTIMIZACIÓN: Caché de Dependencias de Node
+      - name: Cache Node Modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: ${{ runner.os }}-node-
+
+      # Instalación veloz de dependencias gracias al caché
+      - name: Install Composer Dependencies
+        run: composer install --prefer-dist --no-progress --ansi
+
+      - name: Install Node Dependencies
+        run: npm ci --quiet
+
+      # Ejecución Obligatoria de Pruebas
+      - name: Execute Backend Tests
+        run: vendor/bin/phpunit
+
+  build-and-deploy:
+    name: 🚀 Build Docker & Deploy to AWS
+    needs: test-and-validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      # Configuración de credenciales de AWS
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      # Login en Amazon ECR
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Compilación (Vue), Empaquetado y Push de la Imagen Docker
+      - name: Build, Tag, and Push Docker Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: mi-app-laravel-vue
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # El Dockerfile Multi-stage se encarga internamente del empaquetado optimizado
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "IMAGE=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+
+      # Descargar la definición de la tarea actual de AWS ECS
+      - name: Download Active Task Definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition mi-task-def-production \
+            --query taskDefinition > task-definition.json
+
+      # Actualizar el Tag de la Imagen en la Definición de Tarea de ECS
+      - name: Update Image in ECS Task Definition
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: laravel-vue-app
+          image: ${{ env.IMAGE }}
+
+      # Despliegue Continuo hacia el Clúster ECS Fargate
+      - name: Deploy to Amazon ECS Service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: mi-servicio-ecs-fargate
+          cluster: mi-cluster-produccion
+          wait-for-service-stability: true

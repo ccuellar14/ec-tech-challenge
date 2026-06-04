@@ -1,0 +1,46 @@
+name: 🚨 Manual Rollback (ECS Fargate)
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_revision:
+        description: 'Número de revisión de Task Definition a la que deseas regresar (ej. 14)'
+        required: true
+        type: string
+
+jobs:
+  rollback:
+    name: 🔄 Rolling Back Service
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Update ECS Service to Previous Revision
+        run: |
+          CLUSTER_NAME="mi-cluster-produccion"
+          SERVICE_NAME="mi-servicio-ecs-fargate"
+          TASK_FAMILY="mi-task-def-production"
+          TARGET_REV="${{ github.event.inputs.target_revision }}"
+          
+          echo "Iniciando rollback del servicio $SERVICE_NAME a la revisión $TASK_FAMILY:$TARGET_REV..."
+          
+          # Actualizar el servicio de ECS directamente a la definición de tarea antigua
+          aws ecs update-service \
+            --cluster $CLUSTER_NAME \
+            --service $SERVICE_NAME \
+            --task-definition $TASK_FAMILY:$TARGET_REV \
+            --force-new-deployment
+
+      - name: Wait for Service Stability
+        run: |
+          echo "Esperando que el rollback sea exitoso y estable..."
+          aws ecs wait services-stable \
+            --cluster mi-cluster-produccion \
+            --services mi-servicio-ecs-fargate
+          echo "¡Rollback completado con éxito!"
