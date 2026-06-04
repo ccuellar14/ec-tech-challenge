@@ -1,0 +1,87 @@
+name: Rollback Lambda
+
+# ---------------------------------------------------------------------------
+# Rollback manual y optimizado: reapunta el alias del ambiente a una versión
+# previa de la función SIN reconstruir ni redeplegar el stack completo.
+#
+# Es una operación de segundos: solo mueve el puntero del alias.
+# Complementa el auto-rollback de CodeDeploy (que actúa durante el deploy);
+# este workflow cubre el caso "ya desplegó, pasó las alarmas, pero queremos
+# regresar a una versión anterior conocida".
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Ambiente a revertir"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      function_name:
+        description: "Nombre de la función Lambda"
+        required: true
+        type: string
+      target_version:
+        description: "Versión destino. Vacío = versión inmediatamente anterior."
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: rollback-${{ inputs.environment }}-${{ inputs.function_name }}
+  cancel-in-progress: false
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Autenticación AWS vía OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-rollback-${{ inputs.environment }}
+
+      - name: Resolver versión destino
+        id: target
+        run: |
+          ALIAS="${{ inputs.environment }}"
+          FN="${{ inputs.function_name }}"
+
+          TARGET="${{ inputs.target_version }}"
+          if [ -z "$TARGET" ]; then
+            # Versión actual a la que apunta el alias
+            CURRENT=$(aws lambda get-alias \
+              --function-name "$FN" --name "$ALIAS" \
+              --query 'FunctionVersion' --output text)
+            echo "Alias '$ALIAS' apunta actualmente a la versión: $CURRENT"
+
+            # Lista de versiones numéricas ordenadas; tomamos la previa a la actual
+            TARGET=$(aws lambda list-versions-by-function \
+              --function-name "$FN" \
+              --query 'Versions[?Version!=`$LATEST`].Version' --output text \
+              | tr '\t' '\n' | sort -n | awk -v c="$CURRENT" '$0==c{print p} {p=$0}')
+
+            if [ -z "$TARGET" ]; then
+              echo "No existe una versión anterior a $CURRENT. Abortando." >&2
+              exit 1
+            fi
+          fi
+          echo "Revirtiendo a versión: $TARGET"
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+
+      - name: Reapuntar alias (rollback)
+        run: |
+          aws lambda update-alias \
+            --function-name "${{ inputs.function_name }}" \
+            --name "${{ inputs.environment }}" \
+            --function-version "${{ steps.target.outputs.target }}"
+          echo "✓ Rollback completado: alias '${{ inputs.environment }}' -> v${{ steps.target.outputs.target }}"
