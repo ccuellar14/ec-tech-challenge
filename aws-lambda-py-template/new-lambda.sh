@@ -27,6 +27,7 @@ fi
 
 LAMBDA_NAME="$1"
 DEST_DIR="${2:-.}"
+Environment="$3"
 
 # Nombre válido: letras, números, guion y guion bajo
 if [[ ! "$LAMBDA_NAME" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]]; then
@@ -73,21 +74,91 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   ${LAMBDA_NAME} — generada automáticamente.
 
+# ---------------------------------------------------------------------------
+# Parámetros inyectados por el pipeline (workflow deploy.yml)
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Description: Ambiente destino. Se usa también como nombre de alias.
+ 
+  RedisHostParam:
+    Type: String
+    Value: !Ref Environment-redis-host  # Ejemplo: "dev-redis-host"
+    Description: Ruta SSM que contiene redis_host para este ambiente.
+ 
+  DbHostParam:
+    Type: String
+    Value: !Ref Environment-db-host  # Ejemplo: "dev-db-host"
+    Description: Ruta SSM que contiene db_host para este ambiente.
+
+# ---------------------------------------------------------------------------
+# Config de despliegue gradual por ambiente:
+#   - dev/staging: AllAtOnce (rápido, bajo riesgo)
+#   - prod:        Canary 10% por 5 min (detecta fallas antes del 100%)
+# ---------------------------------------------------------------------------
+Mappings:
+  DeployConfig:
+    dev:
+      Type: AllAtOnce
+    staging:
+      Type: AllAtOnce
+    prod:
+      Type: Canary10Percent5Minutes
+
 Globals:
   Function:
     Timeout: 30
     MemorySize: 128
+    RunTime: python3.13
+    architectures:
+      - arm64
 
 Resources:
   ${LAMBDA_NAME//[-_]/}Function:
     Type: AWS::Serverless::Function
     Properties:
-      FunctionName: ${LAMBDA_NAME}
+      FunctionName: ${LAMBDA_NAME}-${Environment}
       CodeUri: ./
       Handler: lambda_function.lambda_handler
-      Runtime: ${RUNTIME}
-      Architectures:
-        - ${ARCH}
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          REDIS_HOST: !Ref RedisHostParam
+          DB_HOST: !Ref DbHostParam
+      # --- Clave del rollback optimizado ---
+      AutoPublishAlias: !Ref Environment      # crea/actualiza alias = nombre del ambiente
+      DeploymentPreference:
+        Type: !FindInMap [DeployConfig, !Ref Environment, Type]
+        Alarms:
+          # Si estas alarmas se disparan durante el shift de tráfico,
+          # CodeDeploy revierte automáticamente al alias anterior.
+          - !Ref ErrorsAlarm
+    # Alarma sobre errores de la función (versión nueva durante el shift)
+  ErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: !Sub "Errores en ${LAMBDA_NAME}-${Environment}"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ${LAMBDA_NAME}Function
+        - Name: Resource
+          Value: !Sub "${LAMBDA_NAME}Function:${Environment}"
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+ 
+Outputs:
+  FunctionArn:
+    Value: !GetAtt ${LAMBDA_NAME}Function.Arn
+  AliasArn:
+    Value: !Ref ${LAMBDA_NAME}Function.Alias
 YAMLEOF
 
 echo "✓ Lambda '${LAMBDA_NAME}' creada en: ${TARGET}"
